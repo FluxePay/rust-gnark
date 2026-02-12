@@ -1,11 +1,14 @@
 //! Build script for rust-gnark.
 //!
 //! Two modes:
-//! 1. **Published crate** (`prebuilt/<target>/` exists): Links the bundled `.a` and `.h` files.
+//! 1. **Published crate** (`prebuilt/<target>/` exists): Links the bundled library and header.
 //!    Downstream consumers never need Go installed.
-//! 2. **Development** (`go/` directory exists): Compiles Go from source via
-//!    `go build -buildmode=c-archive`. Requires Go toolchain (1.24+).
-//!    Cross-compilation env vars are auto-detected from the Rust `TARGET`.
+//! 2. **Development** (`go/` directory exists): Compiles Go from source.
+//!    Requires Go toolchain (1.24+). Cross-compilation env vars are auto-detected
+//!    from the Rust `TARGET`.
+//!
+//! Android targets use `-buildmode=c-shared` (`.so`) because Go does not support
+//! `c-archive` on `GOOS=android`. All other targets use `c-archive` (`.a`).
 //!
 //! Cross-compilation can also be configured explicitly via the `RUST_GNARK_GO_ENVS`
 //! environment variable (format: `"GOOS=ios;GOARCH=arm64;CC=/path/to/cc"`).
@@ -22,34 +25,41 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let target = env::var("TARGET").expect("TARGET not set");
 
+    let is_android = target.contains("linux-android");
+    let (buildmode, lib_name) = if is_android {
+        ("c-shared", "libgnark.so")
+    } else {
+        ("c-archive", "libgnark.a")
+    };
+
     let go_dir = manifest_dir.join("../go");
     let prebuilt_dir = manifest_dir.join("prebuilt").join(&target);
 
     if prebuilt_dir.exists() {
-        let lib_src = prebuilt_dir.join("libgnark.a");
+        let lib_src = prebuilt_dir.join(lib_name);
         let header_src = prebuilt_dir.join("libgnark.h");
 
         assert!(
             lib_src.exists(),
-            "prebuilt/{target}/libgnark.a not found. Rebuild prebuilt libraries."
+            "prebuilt/{target}/{lib_name} not found. Rebuild prebuilt libraries."
         );
         assert!(
             header_src.exists(),
             "prebuilt/{target}/libgnark.h not found. Rebuild prebuilt libraries."
         );
 
-        std::fs::copy(&lib_src, out_dir.join("libgnark.a"))
-            .expect("Failed to copy prebuilt libgnark.a");
+        std::fs::copy(&lib_src, out_dir.join(lib_name))
+            .expect("Failed to copy prebuilt lib");
         std::fs::copy(&header_src, out_dir.join("libgnark.h"))
-            .expect("Failed to copy prebuilt libgnark.h");
+            .expect("Failed to copy prebuilt header");
     } else if go_dir.exists() {
-        let dest = out_dir.join("libgnark.a");
+        let dest = out_dir.join(lib_name);
         let go_envs = detect_go_cross_env(&target, &out_dir);
 
         let mut cmd = Command::new("go");
         cmd.current_dir(&go_dir).env("CGO_ENABLED", "1").args([
             "build",
-            "-buildmode=c-archive",
+            &format!("-buildmode={buildmode}"),
             "-ldflags=-s -w",
             "-gcflags=all=-l -B",
             "-o",
@@ -85,7 +95,11 @@ fn main() {
         .expect("Failed to write bindings.rs");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=gnark");
+    if is_android {
+        println!("cargo:rustc-link-lib=dylib=gnark");
+    } else {
+        println!("cargo:rustc-link-lib=static=gnark");
+    }
     link_platform_deps(&target);
 }
 

@@ -101,10 +101,12 @@ jobs:
                       goos: android
                       goarch: arm64
                       ndk_clang: aarch64-linux-android21-clang
+                      shared: true
                     - target: x86_64-linux-android
                       goos: android
                       goarch: amd64
                       ndk_clang: x86_64-linux-android21-clang
+                      shared: true
         steps:
             - uses: actions/checkout@v4
             - uses: actions/setup-go@v5
@@ -122,7 +124,7 @@ jobs:
               with:
                   ndk-version: r26d
 
-            - name: Build Go static library
+            - name: Build Go library
               working-directory: go
               run: |
                   CC_VAL="${{ matrix.cc }}"
@@ -132,20 +134,26 @@ jobs:
                   if [ -n "$CC_VAL" ]; then
                     export CC="$CC_VAL"
                   fi
+                  if [ "${{ matrix.shared }}" = "true" ]; then
+                    BUILDMODE="c-shared"
+                    OUTPUT="libgnark.so"
+                  else
+                    BUILDMODE="c-archive"
+                    OUTPUT="libgnark.a"
+                  fi
                   CGO_ENABLED=1 \
                   GOOS=${{ matrix.goos }} \
                   GOARCH=${{ matrix.goarch }} \
                   go build \
-                    -buildmode=c-archive \
+                    -buildmode=$BUILDMODE \
                     -ldflags="${GO_LDFLAGS}" \
                     -gcflags="${GO_GCFLAGS}" \
-                    -o libgnark.a .
+                    -o $OUTPUT .
 
             - name: Upload artifact
               uses: actions/upload-artifact@v4
               with:
                   name: prebuilt-${{ matrix.target }}
                   path: |
-                      go/libgnark.a
-                      go/libgnark.h
+                      go/libgnark.*
                   if-no-files-found: error

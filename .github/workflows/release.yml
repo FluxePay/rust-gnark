@@ -34,12 +34,11 @@ jobs:
                   for dir in artifacts/prebuilt-*; do
                     target=$(basename "$dir" | sed 's/^prebuilt-//')
                     mkdir -p "crates/prebuilt/$target"
-                    cp "$dir/go/libgnark.a" "crates/prebuilt/$target/"
-                    cp "$dir/go/libgnark.h" "crates/prebuilt/$target/"
-                    echo "Packaged prebuilt/$target ($(du -sh "crates/prebuilt/$target/libgnark.a" | cut -f1))"
+                    cp "$dir"/go/libgnark.* "crates/prebuilt/$target/"
+                    echo "Packaged prebuilt/$target: $(ls crates/prebuilt/$target/)"
                   done
                   echo "=== All prebuilt targets ==="
-                  ls -la crates/prebuilt/
+                  ls -lR crates/prebuilt/
 
             - name: Create release archive
               run: |
