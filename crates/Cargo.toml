@@ -3,9 +3,7 @@ name = "rust-gnark"
 version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/zkmopro/rust-gnark"
-documentation = "https://zkmopro.org/"
-homepage = "https://zkmopro.org/"
+repository = "https://github.com/FluxePay/rust-gnark"
 description = "Rust bindings for the gnark Groth16 BN254 proving system"
 include = ["src/**", "build.rs", "Cargo.toml", "prebuilt/**"]
 
