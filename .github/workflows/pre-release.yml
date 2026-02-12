@@ -1,0 +1,149 @@
+name: Pre-Release Build
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_call:
+
+env:
+    GO_VERSION: "1.24"
+    GO_LDFLAGS: "-s -w"
+    GO_GCFLAGS: "all=-l -B"
+
+jobs:
+    build-apple:
+        runs-on: macos-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: aarch64-apple-ios
+                      goos: ios
+                      goarch: arm64
+                      sdk: iphoneos
+                      clang_target: arm64-apple-ios13.0
+                    - target: aarch64-apple-ios-sim
+                      goos: ios
+                      goarch: arm64
+                      sdk: iphonesimulator
+                      clang_target: arm64-apple-ios13.0-simulator
+                    - target: x86_64-apple-ios
+                      goos: ios
+                      goarch: amd64
+                      sdk: iphonesimulator
+                      clang_target: x86_64-apple-ios13.0-simulator
+                    - target: aarch64-apple-darwin
+                      goos: darwin
+                      goarch: arm64
+                    - target: x86_64-apple-darwin
+                      goos: darwin
+                      goarch: amd64
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                  go-version: ${{ env.GO_VERSION }}
+
+            - name: Create iOS clang wrapper
+              if: matrix.sdk != ''
+              run: |
+                  cat > /tmp/cc_wrapper.sh << 'SCRIPT'
+                  #!/bin/sh
+                  exec xcrun -sdk $SDK clang -target $CLANG_TARGET "$@"
+                  SCRIPT
+                  chmod +x /tmp/cc_wrapper.sh
+              env:
+                  SDK: ${{ matrix.sdk }}
+                  CLANG_TARGET: ${{ matrix.clang_target }}
+
+            - name: Build Go static library
+              working-directory: go
+              run: |
+                  if [ -n "${{ matrix.sdk }}" ]; then
+                    export CC="/tmp/cc_wrapper.sh"
+                    export SDK="${{ matrix.sdk }}"
+                    export CLANG_TARGET="${{ matrix.clang_target }}"
+                  fi
+                  CGO_ENABLED=1 \
+                  GOOS=${{ matrix.goos }} \
+                  GOARCH=${{ matrix.goarch }} \
+                  go build \
+                    -buildmode=c-archive \
+                    -ldflags="${GO_LDFLAGS}" \
+                    -gcflags="${GO_GCFLAGS}" \
+                    -o libgnark.a .
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: prebuilt-${{ matrix.target }}
+                  path: |
+                      go/libgnark.a
+                      go/libgnark.h
+                  if-no-files-found: error
+
+    build-linux-android:
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: x86_64-unknown-linux-gnu
+                      goos: linux
+                      goarch: amd64
+                    - target: aarch64-unknown-linux-gnu
+                      goos: linux
+                      goarch: arm64
+                      cc: aarch64-linux-gnu-gcc
+                      cross_pkg: gcc-aarch64-linux-gnu
+                    - target: aarch64-linux-android
+                      goos: android
+                      goarch: arm64
+                      ndk_clang: aarch64-linux-android21-clang
+                    - target: x86_64-linux-android
+                      goos: android
+                      goarch: amd64
+                      ndk_clang: x86_64-linux-android21-clang
+        steps:
+            - uses: actions/checkout@v4
+            - uses: actions/setup-go@v5
+              with:
+                  go-version: ${{ env.GO_VERSION }}
+
+            - name: Install cross-compiler
+              if: matrix.cross_pkg != ''
+              run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_pkg }}
+
+            - name: Setup Android NDK
+              if: matrix.ndk_clang != ''
+              uses: nttld/setup-ndk@v1
+              id: setup-ndk
+              with:
+                  ndk-version: r26d
+
+            - name: Build Go static library
+              working-directory: go
+              run: |
+                  CC_VAL="${{ matrix.cc }}"
+                  if [ -n "${{ matrix.ndk_clang }}" ]; then
+                    CC_VAL="${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_clang }}"
+                  fi
+                  CGO_ENABLED=1 \
+                  GOOS=${{ matrix.goos }} \
+                  GOARCH=${{ matrix.goarch }} \
+                  ${CC_VAL:+CC="$CC_VAL"} \
+                  go build \
+                    -buildmode=c-archive \
+                    -ldflags="${GO_LDFLAGS}" \
+                    -gcflags="${GO_GCFLAGS}" \
+                    -o libgnark.a .
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: prebuilt-${{ matrix.target }}
+                  path: |
+                      go/libgnark.a
+                      go/libgnark.h
+                  if-no-files-found: error
