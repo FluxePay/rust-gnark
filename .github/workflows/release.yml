@@ -34,7 +34,7 @@ jobs:
                   for dir in artifacts/prebuilt-*; do
                     target=$(basename "$dir" | sed 's/^prebuilt-//')
                     mkdir -p "crates/prebuilt/$target"
-                    cp "$dir"/go/libgnark.* "crates/prebuilt/$target/"
+                    cp "$dir"/libgnark.* "crates/prebuilt/$target/"
                     echo "Packaged prebuilt/$target: $(ls crates/prebuilt/$target/)"
                   done
                   echo "=== All prebuilt targets ==="
