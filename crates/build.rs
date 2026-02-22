@@ -93,9 +93,17 @@ fn main() {
     }
 
     let header_path = out_dir.join("libgnark.h");
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header(header_path.to_str().expect("Invalid header path"))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+
+    // For iOS targets, bindgen must use the SDK sysroot and a valid clang triple
+    // so that system headers (e.g. stdlib.h) are found and the triple is accepted.
+    if let Some(clang_args) = apple_bindgen_clang_args(&target) {
+        builder = builder.clang_args(clang_args);
+    }
+
+    let bindings = builder
         .generate()
         .expect("Failed to generate Rust bindings from libgnark.h");
     bindings
@@ -271,6 +279,36 @@ fn detect_cc(target: &str, out_dir: &Path) -> Option<String> {
         // macOS and native Linux: system compiler handles it
         _ => None,
     }
+}
+
+/// Return clang args for bindgen when targeting iOS, so that system headers
+/// (e.g. stdlib.h) are found and the target triple is valid for clang.
+/// Without this, bindgen may see an invalid triple (e.g. 'sim' in arm64-apple-ios-sim)
+/// and fail to find the SDK sysroot.
+fn apple_bindgen_clang_args(target: &str) -> Option<Vec<String>> {
+    let (sdk, clang_target) = match target {
+        "aarch64-apple-ios" => ("iphoneos", "arm64-apple-ios13.0"),
+        "aarch64-apple-ios-sim" => ("iphonesimulator", "arm64-apple-ios13.0-simulator"),
+        "x86_64-apple-ios" => ("iphonesimulator", "x86_64-apple-ios13.0-simulator"),
+        _ => return None,
+    };
+    let out = Command::new("xcrun")
+        .args(["-sdk", sdk, "--show-sdk-path"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sdk_path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sdk_path.is_empty() {
+        return None;
+    }
+    Some(vec![
+        "-isysroot".into(),
+        sdk_path,
+        "-target".into(),
+        clang_target.to_string(),
+    ])
 }
 
 /// Create a shell wrapper script for Apple cross-compilation via `xcrun`.
