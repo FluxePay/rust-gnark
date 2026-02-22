@@ -56,6 +56,18 @@ fn main() {
         let dest = out_dir.join(lib_name);
         let go_envs = detect_go_cross_env(&target, &out_dir);
 
+        if is_android {
+            let has_cc = go_envs.iter().any(|(k, _)| k == "CC");
+            if !has_cc {
+                panic!(
+                    "Building rust-gnark for Android from source requires the Android NDK. \
+                     Set ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) to your NDK root, e.g.:\n  \
+                     export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/26.1.10909125\n  \
+                     (Get the NDK via Android Studio: SDK Manager → SDK Tools → NDK.)"
+                );
+            }
+        }
+
         let mut cmd = Command::new("go");
         cmd.current_dir(&go_dir).env("CGO_ENABLED", "1").args([
             "build",
@@ -301,19 +313,20 @@ fn create_apple_cc_wrapper(out_dir: &Path, sdk: &str, clang_target: &str) -> Str
 
 /// Detect Android NDK clang for cross-compilation.
 ///
-/// Searches for the NDK via `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` env vars.
+/// Searches for the NDK via `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or under
+/// `ANDROID_HOME`/`ANDROID_SDK_ROOT` (ndk-bundle or ndk/<version>).
 /// Uses API level 21 (Android 5.0) as the minimum supported version.
 fn detect_android_cc(target: &str) -> Option<String> {
     let ndk = env::var("ANDROID_NDK_HOME")
         .or_else(|_| env::var("ANDROID_NDK_ROOT"))
-        .ok()?;
+        .ok()
+        .or_else(find_ndk_under_sdk)?;
 
-    // Detect host platform for NDK prebuilt path.
-    // build.rs runs on the host, so cfg! reflects the build machine.
-    let host_tag = if cfg!(target_os = "macos") {
-        "darwin-x86_64"
+    // NDK prebuilt host tag: macOS can be darwin-x86_64 or darwin-arm64.
+    let host_tags: Vec<&str> = if cfg!(target_os = "macos") {
+        vec!["darwin-arm64", "darwin-x86_64"]
     } else {
-        "linux-x86_64"
+        vec!["linux-x86_64"]
     };
 
     let clang_name = match target {
@@ -322,17 +335,46 @@ fn detect_android_cc(target: &str) -> Option<String> {
         _ => return None,
     };
 
-    let cc = format!("{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin/{clang_name}");
-
-    if Path::new(&cc).exists() {
-        Some(cc)
-    } else {
-        println!(
-            "cargo:warning=Android NDK clang not found at {cc}. \
-             Cross-compilation may fail. Set ANDROID_NDK_HOME correctly."
-        );
-        None
+    for host_tag in &host_tags {
+        let cc = format!("{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin/{clang_name}");
+        if Path::new(&cc).exists() {
+            return Some(cc);
+        }
     }
+
+    println!(
+        "cargo:warning=Android NDK clang not found under {ndk} (tried host tags: {:?}). \
+         Set ANDROID_NDK_HOME to the NDK root.",
+        host_tags
+    );
+    None
+}
+
+/// Try to find NDK under ANDROID_HOME or ANDROID_SDK_ROOT (ndk-bundle or ndk/<ver>).
+fn find_ndk_under_sdk() -> Option<String> {
+    let sdk = env::var("ANDROID_HOME")
+        .or_else(|_| env::var("ANDROID_SDK_ROOT"))
+        .ok()?;
+    let sdk_path = Path::new(&sdk);
+    let ndk_bundle = sdk_path.join("ndk-bundle");
+    if ndk_bundle.is_dir() {
+        return ndk_bundle.into_os_string().into_string().ok();
+    }
+    let ndk_dir = sdk_path.join("ndk");
+    if ndk_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&ndk_dir) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort_by(|a, b| b.cmp(a)); // newest first
+            if let Some(first) = versions.into_iter().next() {
+                return first.into_os_string().into_string().ok();
+            }
+        }
+    }
+    None
 }
 
 /// Parse cross-compilation environment variables from `RUST_GNARK_GO_ENVS`.
