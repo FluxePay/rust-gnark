@@ -56,6 +56,18 @@ fn main() {
         let dest = out_dir.join(lib_name);
         let go_envs = detect_go_cross_env(&target, &out_dir);
 
+        if is_android {
+            let has_cc = go_envs.iter().any(|(k, _)| k == "CC");
+            if !has_cc {
+                panic!(
+                    "Building rust-gnark for Android from source requires the Android NDK. \
+                     Set ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) to your NDK root, e.g.:\n  \
+                     export ANDROID_NDK_HOME=~/Library/Android/sdk/ndk/26.1.10909125\n  \
+                     (Get the NDK via Android Studio: SDK Manager → SDK Tools → NDK.)"
+                );
+            }
+        }
+
         let mut cmd = Command::new("go");
         cmd.current_dir(&go_dir).env("CGO_ENABLED", "1").args([
             "build",
@@ -81,9 +93,17 @@ fn main() {
     }
 
     let header_path = out_dir.join("libgnark.h");
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header(header_path.to_str().expect("Invalid header path"))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+
+    // For iOS targets, bindgen must use the SDK sysroot and a valid clang triple
+    // so that system headers (e.g. stdlib.h) are found and the triple is accepted.
+    if let Some(clang_args) = apple_bindgen_clang_args(&target) {
+        builder = builder.clang_args(clang_args);
+    }
+
+    let bindings = builder
         .generate()
         .expect("Failed to generate Rust bindings from libgnark.h");
     bindings
@@ -96,6 +116,27 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=static=gnark");
     }
+    let libgnark_path = out_dir.join("libgnark.so");
+
+    // cargo-ndk sets this env var pointing to the jniLibs/<abi>/ folder
+    if let Ok(ndk_output) = env::var("CARGO_NDK_OUTPUT_PATH") {
+        let abi = match target.as_str() {
+            "aarch64-linux-android" => "arm64-v8a",
+            "x86_64-linux-android" => "x86_64",
+            "armv7-linux-androideabi" => "armeabi-v7a",
+            "i686-linux-android" => "x86",
+            _ => panic!("Unsupported target: {}", target),
+        };
+
+        let dest_dir = PathBuf::from(&ndk_output).join(abi);
+        std::fs::create_dir_all(&dest_dir).expect("Failed to create destination directory");
+
+        let dest = dest_dir.join("libgnark.so");
+        std::fs::copy(&libgnark_path, &dest).expect("Failed to copy libgnark.so");
+
+        println!("cargo:warning=Copied libgnark.so to {}", dest.display());
+    }
+
     link_platform_deps(&target);
 }
 
@@ -261,6 +302,36 @@ fn detect_cc(target: &str, out_dir: &Path) -> Option<String> {
     }
 }
 
+/// Return clang args for bindgen when targeting iOS, so that system headers
+/// (e.g. stdlib.h) are found and the target triple is valid for clang.
+/// Without this, bindgen may see an invalid triple (e.g. 'sim' in arm64-apple-ios-sim)
+/// and fail to find the SDK sysroot.
+fn apple_bindgen_clang_args(target: &str) -> Option<Vec<String>> {
+    let (sdk, clang_target) = match target {
+        "aarch64-apple-ios" => ("iphoneos", "arm64-apple-ios13.0"),
+        "aarch64-apple-ios-sim" => ("iphonesimulator", "arm64-apple-ios13.0-simulator"),
+        "x86_64-apple-ios" => ("iphonesimulator", "x86_64-apple-ios13.0-simulator"),
+        _ => return None,
+    };
+    let out = Command::new("xcrun")
+        .args(["-sdk", sdk, "--show-sdk-path"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sdk_path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sdk_path.is_empty() {
+        return None;
+    }
+    Some(vec![
+        "-isysroot".into(),
+        sdk_path,
+        "-target".into(),
+        clang_target.to_string(),
+    ])
+}
+
 /// Create a shell wrapper script for Apple cross-compilation via `xcrun`.
 ///
 /// The wrapper invokes `xcrun -sdk <sdk> clang -target <triple>` which
@@ -301,19 +372,20 @@ fn create_apple_cc_wrapper(out_dir: &Path, sdk: &str, clang_target: &str) -> Str
 
 /// Detect Android NDK clang for cross-compilation.
 ///
-/// Searches for the NDK via `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT` env vars.
+/// Searches for the NDK via `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, or under
+/// `ANDROID_HOME`/`ANDROID_SDK_ROOT` (ndk-bundle or ndk/<version>).
 /// Uses API level 21 (Android 5.0) as the minimum supported version.
 fn detect_android_cc(target: &str) -> Option<String> {
     let ndk = env::var("ANDROID_NDK_HOME")
         .or_else(|_| env::var("ANDROID_NDK_ROOT"))
-        .ok()?;
+        .ok()
+        .or_else(find_ndk_under_sdk)?;
 
-    // Detect host platform for NDK prebuilt path.
-    // build.rs runs on the host, so cfg! reflects the build machine.
-    let host_tag = if cfg!(target_os = "macos") {
-        "darwin-x86_64"
+    // NDK prebuilt host tag: macOS can be darwin-x86_64 or darwin-arm64.
+    let host_tags: Vec<&str> = if cfg!(target_os = "macos") {
+        vec!["darwin-arm64", "darwin-x86_64"]
     } else {
-        "linux-x86_64"
+        vec!["linux-x86_64"]
     };
 
     let clang_name = match target {
@@ -322,17 +394,46 @@ fn detect_android_cc(target: &str) -> Option<String> {
         _ => return None,
     };
 
-    let cc = format!("{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin/{clang_name}");
-
-    if Path::new(&cc).exists() {
-        Some(cc)
-    } else {
-        println!(
-            "cargo:warning=Android NDK clang not found at {cc}. \
-             Cross-compilation may fail. Set ANDROID_NDK_HOME correctly."
-        );
-        None
+    for host_tag in &host_tags {
+        let cc = format!("{ndk}/toolchains/llvm/prebuilt/{host_tag}/bin/{clang_name}");
+        if Path::new(&cc).exists() {
+            return Some(cc);
+        }
     }
+
+    println!(
+        "cargo:warning=Android NDK clang not found under {ndk} (tried host tags: {:?}). \
+         Set ANDROID_NDK_HOME to the NDK root.",
+        host_tags
+    );
+    None
+}
+
+/// Try to find NDK under ANDROID_HOME or ANDROID_SDK_ROOT (ndk-bundle or ndk/<ver>).
+fn find_ndk_under_sdk() -> Option<String> {
+    let sdk = env::var("ANDROID_HOME")
+        .or_else(|_| env::var("ANDROID_SDK_ROOT"))
+        .ok()?;
+    let sdk_path = Path::new(&sdk);
+    let ndk_bundle = sdk_path.join("ndk-bundle");
+    if ndk_bundle.is_dir() {
+        return ndk_bundle.into_os_string().into_string().ok();
+    }
+    let ndk_dir = sdk_path.join("ndk");
+    if ndk_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&ndk_dir) {
+            let mut versions: Vec<PathBuf> = entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            versions.sort_by(|a, b| b.cmp(a)); // newest first
+            if let Some(first) = versions.into_iter().next() {
+                return first.into_os_string().into_string().ok();
+            }
+        }
+    }
+    None
 }
 
 /// Parse cross-compilation environment variables from `RUST_GNARK_GO_ENVS`.
