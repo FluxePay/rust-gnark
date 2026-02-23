@@ -116,6 +116,27 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=static=gnark");
     }
+    let libgnark_path = out_dir.join("libgnark.so");
+
+    // cargo-ndk sets this env var pointing to the jniLibs/<abi>/ folder
+    if let Ok(ndk_output) = env::var("CARGO_NDK_OUTPUT_PATH") {
+        let abi = match target.as_str() {
+            "aarch64-linux-android" => "arm64-v8a",
+            "x86_64-linux-android" => "x86_64",
+            "armv7-linux-androideabi" => "armeabi-v7a",
+            "i686-linux-android" => "x86",
+            _ => panic!("Unsupported target: {}", target),
+        };
+
+        let dest_dir = PathBuf::from(&ndk_output).join(abi);
+        std::fs::create_dir_all(&dest_dir).expect("Failed to create destination directory");
+
+        let dest = dest_dir.join("libgnark.so");
+        std::fs::copy(&libgnark_path, &dest).expect("Failed to copy libgnark.so");
+
+        println!("cargo:warning=Copied libgnark.so to {}", dest.display());
+    }
+
     link_platform_deps(&target);
 }
 
