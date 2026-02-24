@@ -63,9 +63,7 @@ jobs:
               if: startsWith(github.ref, 'refs/tags/')
               uses: softprops/action-gh-release@v2
               with:
-                  files: |
-                      prebuilt-all.tar.gz
-                      prebuilt-*.tar.gz
+                  files: prebuilt-*.tar.gz
                   generate_release_notes: true
                   body: |
                       ## rust-gnark ${{ github.ref_name }}
