@@ -11,6 +11,13 @@ typedef struct {
     char *public_inputs;  // hex-encoded binary public witness (MarshalBinary)
     char *error;          // error message or NULL on success
 } C_Groth16ProofResult;
+
+// Result struct for PLONK proof generation.
+typedef struct {
+    char *proof;
+    char *public_inputs;
+    char *error;
+} C_PlonkProofResult;
 */
 import "C"
 
@@ -25,6 +32,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/backend/plonk"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
 	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
@@ -195,13 +203,31 @@ func gnark_free_string(s *C.char) {
 	}
 }
 
+// getVariableNames extracts public and secret variable names from a BN254
+// constraint system. Supports both R1CS (Groth16) and SparseR1CS (PLONK).
+// Public[0] is always "1" (the constant wire) and is skipped.
+func getVariableNames(cs constraint.ConstraintSystem) (publicNames []string, secretNames []string, err error) {
+	// In gnark v0.14+ the R1CS and SparseR1CS types are unified.
+	v, ok := cs.(*cs_bn254.R1CS)
+	if !ok {
+		return nil, nil, fmt.Errorf("unsupported BN254 constraint system type: %T", cs)
+	}
+	pub := v.Public
+	// R1CS has "1" as Public[0] (constant wire) — skip it.
+	// PLONK's SCS does not include this constant wire.
+	if len(pub) > 0 && pub[0] == "1" {
+		pub = pub[1:]
+	}
+	return pub, v.Secret, nil
+}
+
 // buildWitnessFromJSON creates a gnark witness from a JSON object mapping
 // circuit variable names to decimal string values.
 //
 // The JSON format is: {"VarName": "decimal_value", ...}
 // Variable names must match those defined in the circuit (via gnark struct tags).
 //
-// This function accesses the R1CS's embedded variable name lists (Public/Secret)
+// This function accesses the constraint system's variable name lists (Public/Secret)
 // to determine the correct ordering, then uses witness.Fill to populate values.
 func buildWitnessFromJSON(jsonStr string, cs constraint.ConstraintSystem) (witness.Witness, error) {
 	var flatMap map[string]interface{}
@@ -209,17 +235,10 @@ func buildWitnessFromJSON(jsonStr string, cs constraint.ConstraintSystem) (witne
 		return nil, fmt.Errorf("failed to parse witness JSON: %w", err)
 	}
 
-	// Type-assert to the concrete BN254 R1CS to access variable name lists.
-	// The constraint.System struct (embedded in R1CS) stores Public and Secret
-	// variable names as []string. Public[0] is always "1" (the constant wire).
-	r1cs, ok := cs.(*cs_bn254.R1CS)
-	if !ok {
-		return nil, fmt.Errorf("expected BN254 R1CS, got %T", cs)
+	publicNames, secretNames, err := getVariableNames(cs)
+	if err != nil {
+		return nil, err
 	}
-
-	// Skip "1" constant wire in public variables
-	publicNames := r1cs.Public[1:]
-	secretNames := r1cs.Secret
 
 	nbPublic := len(publicNames)
 	nbSecret := len(secretNames)
@@ -271,6 +290,152 @@ func toFieldElement(v interface{}) interface{} {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+//export gnark_plonk_prove
+func gnark_plonk_prove(
+	scs_path *C.char,
+	pk_path *C.char,
+	witness_json *C.char,
+) *C.C_PlonkProofResult {
+	result := (*C.C_PlonkProofResult)(C.malloc(C.size_t(unsafe.Sizeof(C.C_PlonkProofResult{}))))
+	result.proof = nil
+	result.public_inputs = nil
+	result.error = nil
+
+	cs := plonk.NewCS(ecc.BN254)
+	scsFile, err := os.Open(C.GoString(scs_path))
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to open scs file: %v", err))
+		return result
+	}
+	defer scsFile.Close()
+
+	if _, err := cs.ReadFrom(scsFile); err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to read scs: %v", err))
+		return result
+	}
+
+	pk := plonk.NewProvingKey(ecc.BN254)
+	pkFile, err := os.Open(C.GoString(pk_path))
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to open pk file: %v", err))
+		return result
+	}
+	defer pkFile.Close()
+
+	if _, err := pk.UnsafeReadFrom(pkFile); err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to read plonk proving key: %v", err))
+		return result
+	}
+
+	witnessJSON := C.GoString(witness_json)
+	fullWitness, err := buildWitnessFromJSON(witnessJSON, cs)
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to build witness: %v", err))
+		return result
+	}
+
+	proof, err := plonk.Prove(cs, pk, fullWitness)
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("plonk proof generation failed: %v", err))
+		return result
+	}
+
+	var proofBuf bytes.Buffer
+	if _, err := proof.WriteTo(&proofBuf); err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to serialize plonk proof: %v", err))
+		return result
+	}
+	result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
+
+	pubWitness, err := fullWitness.Public()
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to extract public witness: %v", err))
+		return result
+	}
+	pubBin, err := pubWitness.MarshalBinary()
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to marshal public witness: %v", err))
+		return result
+	}
+	result.public_inputs = C.CString(hex.EncodeToString(pubBin))
+
+	return result
+}
+
+//export gnark_plonk_verify
+func gnark_plonk_verify(
+	scs_path *C.char,
+	vk_path *C.char,
+	proof_hex *C.char,
+	public_inputs_hex *C.char,
+) *C.char {
+	cs := plonk.NewCS(ecc.BN254)
+	scsFile, err := os.Open(C.GoString(scs_path))
+	if err != nil {
+		return C.CString(fmt.Sprintf("failed to open scs file: %v", err))
+	}
+	defer scsFile.Close()
+
+	if _, err := cs.ReadFrom(scsFile); err != nil {
+		return C.CString(fmt.Sprintf("failed to read scs: %v", err))
+	}
+
+	vk := plonk.NewVerifyingKey(ecc.BN254)
+	vkFile, err := os.Open(C.GoString(vk_path))
+	if err != nil {
+		return C.CString(fmt.Sprintf("failed to open vk file: %v", err))
+	}
+	defer vkFile.Close()
+
+	if _, err := vk.ReadFrom(vkFile); err != nil {
+		return C.CString(fmt.Sprintf("failed to read plonk verifying key: %v", err))
+	}
+
+	proofBytes, err := hex.DecodeString(C.GoString(proof_hex))
+	if err != nil {
+		return C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
+	}
+	proof := plonk.NewProof(ecc.BN254)
+	if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+		return C.CString(fmt.Sprintf("failed to deserialize plonk proof: %v", err))
+	}
+
+	pubBytes, err := hex.DecodeString(C.GoString(public_inputs_hex))
+	if err != nil {
+		return C.CString(fmt.Sprintf("failed to decode public inputs hex: %v", err))
+	}
+	pubWitness, err := witness.New(ecc.BN254.ScalarField())
+	if err != nil {
+		return C.CString(fmt.Sprintf("failed to create witness: %v", err))
+	}
+	if err := pubWitness.UnmarshalBinary(pubBytes); err != nil {
+		return C.CString(fmt.Sprintf("failed to unmarshal public witness: %v", err))
+	}
+
+	if err := plonk.Verify(proof, vk, pubWitness); err != nil {
+		return C.CString(fmt.Sprintf("invalid proof: %v", err))
+	}
+
+	return nil
+}
+
+//export gnark_free_plonk_proof_result
+func gnark_free_plonk_proof_result(r *C.C_PlonkProofResult) {
+	if r == nil {
+		return
+	}
+	if r.proof != nil {
+		C.free(unsafe.Pointer(r.proof))
+	}
+	if r.public_inputs != nil {
+		C.free(unsafe.Pointer(r.public_inputs))
+	}
+	if r.error != nil {
+		C.free(unsafe.Pointer(r.error))
+	}
+	C.free(unsafe.Pointer(r))
 }
 
 func main() {} // required for c-archive build mode
