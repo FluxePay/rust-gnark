@@ -31,11 +31,16 @@ import (
 	"unsafe"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
+	bn254 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/backend/plonk"
+	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
 	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
+	_ "github.com/consensys/gnark/std"
+	_ "github.com/FluxePay/gnark-plonky2-verifier/babybear"
 )
 
 //export gnark_init
@@ -93,18 +98,18 @@ func gnark_groth16_prove(
 		return result
 	}
 
-	proof, err := groth16.Prove(cs, pk, fullWitness)
+	proof, err := groth16.Prove(cs, pk, fullWitness, solidity.WithProverTargetSolidityVerifier(backend.GROTH16))
 	if err != nil {
 		result.error = C.CString(fmt.Sprintf("proof generation failed: %v", err))
 		return result
 	}
 
-	var proofBuf bytes.Buffer
-	if _, err := proof.WriteTo(&proofBuf); err != nil {
+	solidityBytes, err := proofToSolidityBytes(proof)
+	if err != nil {
 		result.error = C.CString(fmt.Sprintf("failed to serialize proof: %v", err))
 		return result
 	}
-	result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
+	result.proof = C.CString(hex.EncodeToString(solidityBytes))
 
 	pubWitness, err := fullWitness.Public()
 	if err != nil {
@@ -436,6 +441,15 @@ func gnark_free_plonk_proof_result(r *C.C_PlonkProofResult) {
 		C.free(unsafe.Pointer(r.error))
 	}
 	C.free(unsafe.Pointer(r))
+}
+
+func proofToSolidityBytes(proof groth16.Proof) ([]byte, error) {
+	switch p := proof.(type) {
+	case *bn254.Proof:
+		return p.MarshalSolidity(), nil
+	default:
+		return nil, fmt.Errorf("unsupported proof type %T", proof)
+	}
 }
 
 func main() {} // required for c-archive build mode
