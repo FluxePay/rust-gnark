@@ -6,7 +6,10 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use rust_gnark::{groth16_prove, groth16_verify, init, plonk_prove, plonk_verify};
+    use rust_gnark::{
+        groth16_prove, groth16_solidity_calldata, groth16_verify, init, plonk_prove,
+        plonk_solidity_calldata, plonk_verify,
+    };
 
     const R1CS_PATH: &str = "./test-vectors/cubic_circuit.r1cs";
     const GROTH16_PK_PATH: &str = "./test-vectors/cubic_circuit.pk";
@@ -16,6 +19,12 @@ mod tests {
     const PLONK_PK_PATH: &str = "./test-vectors/cubic_circuit_plonk.pk";
     const PLONK_VK_PATH: &str = "./test-vectors/cubic_circuit_plonk.vk";
 
+    // Cubic circuit + a Pedersen commitment: the only vector where the Groth16
+    // target_solidity flag actually changes the proof (Keccak256 hash-to-field).
+    const COMMITTED_R1CS_PATH: &str = "./test-vectors/committed_circuit.r1cs";
+    const COMMITTED_PK_PATH: &str = "./test-vectors/committed_circuit.pk";
+    const COMMITTED_VK_PATH: &str = "./test-vectors/committed_circuit.vk";
+
     const WITNESS_JSON: &str = r#"{"X": "3", "Y": "35"}"#;
 
     // --- Groth16 tests ---
@@ -24,7 +33,7 @@ mod tests {
     fn test_groth16_prove_verify_roundtrip() -> Result<()> {
         init()?;
 
-        let proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON)?;
+        let proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON, false)?;
 
         assert!(!proof_result.proof.is_empty(), "Proof should not be empty");
         assert!(
@@ -32,7 +41,7 @@ mod tests {
             "Public inputs should not be empty"
         );
 
-        let valid = groth16_verify(R1CS_PATH, GROTH16_VK_PATH, &proof_result)?;
+        let valid = groth16_verify(R1CS_PATH, GROTH16_VK_PATH, &proof_result, false)?;
         assert!(valid, "Proof should be valid");
 
         Ok(())
@@ -42,7 +51,7 @@ mod tests {
     fn test_groth16_verify_rejects_tampered_proof() -> Result<()> {
         init()?;
 
-        let mut proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON)?;
+        let mut proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON, false)?;
 
         let mut chars: Vec<char> = proof_result.proof.chars().collect();
         if chars.len() > 10 {
@@ -50,11 +59,128 @@ mod tests {
         }
         proof_result.proof = chars.into_iter().collect();
 
-        let result = groth16_verify(R1CS_PATH, GROTH16_VK_PATH, &proof_result);
+        let result = groth16_verify(R1CS_PATH, GROTH16_VK_PATH, &proof_result, false);
         if let Ok(valid) = result {
             assert!(!valid, "Tampered proof should not be valid");
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_groth16_solidity_roundtrip() -> Result<()> {
+        init()?;
+
+        // Prove + verify must agree on target_solidity.
+        let proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON, true)?;
+        let valid = groth16_verify(R1CS_PATH, GROTH16_VK_PATH, &proof_result, true)?;
+        assert!(
+            valid,
+            "Solidity-target proof should verify with the same flag"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_groth16_solidity_calldata() -> Result<()> {
+        init()?;
+
+        let proof_result = groth16_prove(R1CS_PATH, GROTH16_PK_PATH, WITNESS_JSON, true)?;
+        let calldata = groth16_solidity_calldata(&proof_result)?;
+
+        // Cubic circuit has no commitments: proof is exactly Ar|Bs|Krs = 8 * 32 bytes.
+        assert_eq!(
+            calldata.num_commitments, 0,
+            "cubic circuit has no commitments"
+        );
+        assert_eq!(
+            calldata.proof.len(),
+            8 * 32 * 2,
+            "Groth16 proof calldata should be 8 field elements (hex)"
+        );
+        // One public input (Y) -> 32 bytes -> 64 hex chars.
+        assert_eq!(
+            calldata.public_inputs.len(),
+            32 * 2,
+            "one public input expected"
+        );
+
+        Ok(())
+    }
+
+    // --- Groth16 committed-circuit tests (the flag is NOT a no-op here) ---
+
+    #[test]
+    fn test_committed_native_roundtrip() -> Result<()> {
+        init()?;
+
+        let proof = groth16_prove(COMMITTED_R1CS_PATH, COMMITTED_PK_PATH, WITNESS_JSON, false)?;
+        let valid = groth16_verify(COMMITTED_R1CS_PATH, COMMITTED_VK_PATH, &proof, false)?;
+        assert!(valid, "native prove+verify should round-trip");
+        Ok(())
+    }
+
+    #[test]
+    fn test_committed_solidity_roundtrip() -> Result<()> {
+        init()?;
+
+        let proof = groth16_prove(COMMITTED_R1CS_PATH, COMMITTED_PK_PATH, WITNESS_JSON, true)?;
+        let valid = groth16_verify(COMMITTED_R1CS_PATH, COMMITTED_VK_PATH, &proof, true)?;
+        assert!(valid, "solidity prove+verify should round-trip");
+        Ok(())
+    }
+
+    /// The core proof that the flag actually does something: a Solidity-target
+    /// proof (Keccak256 commitment hash) must NOT verify under the native hash,
+    /// and vice-versa. If the flag were ignored, both would still verify.
+    #[test]
+    fn test_committed_solidity_native_mismatch() -> Result<()> {
+        init()?;
+
+        let sol_proof = groth16_prove(COMMITTED_R1CS_PATH, COMMITTED_PK_PATH, WITNESS_JSON, true)?;
+        let cross = groth16_verify(COMMITTED_R1CS_PATH, COMMITTED_VK_PATH, &sol_proof, false);
+        assert!(
+            !matches!(cross, Ok(true)),
+            "solidity proof must not verify under native hash (got {cross:?})"
+        );
+
+        let native_proof =
+            groth16_prove(COMMITTED_R1CS_PATH, COMMITTED_PK_PATH, WITNESS_JSON, false)?;
+        let cross = groth16_verify(COMMITTED_R1CS_PATH, COMMITTED_VK_PATH, &native_proof, true);
+        assert!(
+            !matches!(cross, Ok(true)),
+            "native proof must not verify under solidity hash (got {cross:?})"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_committed_solidity_calldata_has_commitments() -> Result<()> {
+        init()?;
+
+        let proof = groth16_prove(COMMITTED_R1CS_PATH, COMMITTED_PK_PATH, WITNESS_JSON, true)?;
+        let calldata = groth16_solidity_calldata(&proof)?;
+
+        // One commitment => proof blob is proof[8] | commitments[2] | commitmentPok[2]
+        // = 12 field elements.
+        assert_eq!(
+            calldata.num_commitments, 1,
+            "circuit has exactly one commitment"
+        );
+        assert_eq!(
+            calldata.proof.len(),
+            12 * 32 * 2,
+            "expected 8 + 2*1 + 2 = 12 field elements of calldata"
+        );
+        // The commitment wire is NOT part of the public witness: input[] holds
+        // only the circuit's declared public input (Y). The commitment travels
+        // separately in the proof blob.
+        assert_eq!(
+            calldata.public_inputs.len(),
+            32 * 2,
+            "committed circuit still has exactly one public input (Y)"
+        );
         Ok(())
     }
 
@@ -64,7 +190,7 @@ mod tests {
     fn test_plonk_prove_verify_roundtrip() -> Result<()> {
         init()?;
 
-        let proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON)?;
+        let proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON, false)?;
 
         assert!(!proof_result.proof.is_empty(), "Proof should not be empty");
         assert!(
@@ -72,7 +198,7 @@ mod tests {
             "Public inputs should not be empty"
         );
 
-        let valid = plonk_verify(SCS_PATH, PLONK_VK_PATH, &proof_result)?;
+        let valid = plonk_verify(SCS_PATH, PLONK_VK_PATH, &proof_result, false)?;
         assert!(valid, "Proof should be valid");
 
         Ok(())
@@ -82,7 +208,7 @@ mod tests {
     fn test_plonk_verify_rejects_tampered_proof() -> Result<()> {
         init()?;
 
-        let mut proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON)?;
+        let mut proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON, false)?;
 
         let mut chars: Vec<char> = proof_result.proof.chars().collect();
         if chars.len() > 10 {
@@ -90,10 +216,47 @@ mod tests {
         }
         proof_result.proof = chars.into_iter().collect();
 
-        let result = plonk_verify(SCS_PATH, PLONK_VK_PATH, &proof_result);
+        let result = plonk_verify(SCS_PATH, PLONK_VK_PATH, &proof_result, false);
         if let Ok(valid) = result {
             assert!(!valid, "Tampered proof should not be valid");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_plonk_solidity_roundtrip() -> Result<()> {
+        init()?;
+
+        // For PLONK the flag is a no-op, but prove+verify must still round-trip.
+        let proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON, true)?;
+        let valid = plonk_verify(SCS_PATH, PLONK_VK_PATH, &proof_result, true)?;
+        assert!(valid, "Solidity-target PLONK proof should verify");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_plonk_solidity_calldata() -> Result<()> {
+        init()?;
+
+        let proof_result = plonk_prove(SCS_PATH, PLONK_PK_PATH, WITNESS_JSON, true)?;
+        let calldata = plonk_solidity_calldata(&proof_result)?;
+
+        assert_eq!(
+            calldata.num_commitments, 0,
+            "PLONK reports no commitment split"
+        );
+        assert!(
+            !calldata.proof.is_empty(),
+            "PLONK proof calldata should not be empty"
+        );
+        // One public input (Y) -> 32 bytes -> 64 hex chars.
+        assert_eq!(
+            calldata.public_inputs.len(),
+            32 * 2,
+            "one public input expected"
+        );
 
         Ok(())
     }

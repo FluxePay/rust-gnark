@@ -22,7 +22,7 @@
 
 use anyhow::{bail, Result};
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 
 // Suppress warnings on bindgen-generated code (doesn't follow Rust conventions).
 #[allow(warnings, clippy::all)]
@@ -67,6 +67,12 @@ pub fn init() -> Result<()> {
 /// * `pk_path` - Path to the `.pk` file (gnark binary, loaded via `UnsafeReadFrom` for speed)
 /// * `witness_json` - JSON object mapping circuit field names to decimal string values,
 ///   e.g. `{"A": "3", "B": "5"}`
+/// * `target_solidity` - When `true`, generate a proof verifiable by gnark's
+///   Solidity verifier: the commitment public input is hashed with legacy
+///   Keccak256 instead of the default RFC-9380 hash-to-field. This only changes
+///   the proof for circuits that use Pedersen commitments; for commitment-free
+///   circuits it is a no-op. A proof made with one setting will **not** verify
+///   under the other, so prove and verify must use the same value.
 ///
 /// # Returns
 ///
@@ -79,6 +85,7 @@ pub fn groth16_prove(
     r1cs_path: &str,
     pk_path: &str,
     witness_json: &str,
+    target_solidity: bool,
 ) -> Result<Groth16ProofResult> {
     let r1cs = CString::new(r1cs_path)?;
     let pk = CString::new(pk_path)?;
@@ -89,6 +96,7 @@ pub fn groth16_prove(
             r1cs.as_ptr() as *mut c_char,
             pk.as_ptr() as *mut c_char,
             witness.as_ptr() as *mut c_char,
+            target_solidity as c_int,
         )
     };
 
@@ -130,6 +138,9 @@ pub fn groth16_prove(
 /// * `r1cs_path` - Path to the `.r1cs` file
 /// * `vk_path` - Path to the `.vk` file (gnark binary, loaded via `ReadFrom`)
 /// * `proof_result` - The proof result from [`groth16_prove`]
+/// * `target_solidity` - Must match the value passed to [`groth16_prove`] when
+///   the proof was generated (see its docs). Uses the Keccak256 hash-to-field
+///   so verification matches gnark's Solidity verifier.
 ///
 /// # Returns
 ///
@@ -143,6 +154,7 @@ pub fn groth16_verify(
     r1cs_path: &str,
     vk_path: &str,
     proof_result: &Groth16ProofResult,
+    target_solidity: bool,
 ) -> Result<bool> {
     let r1cs = CString::new(r1cs_path)?;
     let vk = CString::new(vk_path)?;
@@ -155,6 +167,7 @@ pub fn groth16_verify(
             vk.as_ptr() as *mut c_char,
             proof.as_ptr() as *mut c_char,
             pub_inputs.as_ptr() as *mut c_char,
+            target_solidity as c_int,
         )
     };
 
@@ -196,6 +209,10 @@ pub struct PlonkProofResult {
 /// * `pk_path` - Path to the `.pk` file (PLONK proving key)
 /// * `witness_json` - JSON object mapping circuit field names to decimal string values,
 ///   e.g. `{"A": "3", "B": "5"}`
+/// * `target_solidity` - When `true`, apply gnark's Solidity-target prover
+///   option. For PLONK the default prover is already Solidity-compatible, so
+///   this is a documented no-op; it is accepted for symmetry with Groth16 and
+///   forward-compatibility.
 ///
 /// # Returns
 ///
@@ -208,6 +225,7 @@ pub fn plonk_prove(
     scs_path: &str,
     pk_path: &str,
     witness_json: &str,
+    target_solidity: bool,
 ) -> Result<PlonkProofResult> {
     let scs = CString::new(scs_path)?;
     let pk = CString::new(pk_path)?;
@@ -218,6 +236,7 @@ pub fn plonk_prove(
             scs.as_ptr() as *mut c_char,
             pk.as_ptr() as *mut c_char,
             witness.as_ptr() as *mut c_char,
+            target_solidity as c_int,
         )
     };
 
@@ -259,6 +278,8 @@ pub fn plonk_prove(
 /// * `scs_path` - Path to the `.scs` file
 /// * `vk_path` - Path to the `.vk` file (PLONK verifying key)
 /// * `proof_result` - The proof result from [`plonk_prove`]
+/// * `target_solidity` - Should match the value passed to [`plonk_prove`]. A
+///   no-op for PLONK (see its docs), accepted for symmetry with Groth16.
 ///
 /// # Returns
 ///
@@ -272,6 +293,7 @@ pub fn plonk_verify(
     scs_path: &str,
     vk_path: &str,
     proof_result: &PlonkProofResult,
+    target_solidity: bool,
 ) -> Result<bool> {
     let scs = CString::new(scs_path)?;
     let vk = CString::new(vk_path)?;
@@ -284,6 +306,7 @@ pub fn plonk_verify(
             vk.as_ptr() as *mut c_char,
             proof.as_ptr() as *mut c_char,
             pub_inputs.as_ptr() as *mut c_char,
+            target_solidity as c_int,
         )
     };
 
@@ -300,5 +323,118 @@ pub fn plonk_verify(
         } else {
             bail!("Verification error: {err}")
         }
+    }
+}
+
+/// Solidity calldata for a proof, ready to submit to a gnark-generated verifier
+/// contract.
+///
+/// All fields are hex-encoded (no `0x` prefix). ABI-encoding these into an
+/// actual transaction is left to the caller, since it depends on the exact
+/// generated contract signature.
+#[derive(Debug, Clone)]
+pub struct SolidityCalldata {
+    /// Hex-encoded `proof.MarshalSolidity()` output.
+    ///
+    /// - **Groth16:** `Ar | Bs | Krs` — 8 field elements (256 bytes) — optionally
+    ///   followed by `commitments` (2 × [`num_commitments`](Self::num_commitments)
+    ///   field elements) and a `commitmentPok` (2 field elements). Split it as
+    ///   `proof[8] | commitments[2*n] | commitmentPok[2]` for the on-chain
+    ///   `verifyProof(uint256[8], [uint256[2n], uint256[2],] uint256[])`.
+    /// - **PLONK:** the raw proof blob, passed whole as the `bytes` argument of
+    ///   `Verify(bytes, uint256[])`.
+    pub proof: String,
+    /// Hex-encoded concatenation of the public witness field elements, each a
+    /// 32-byte big-endian value — i.e. the Solidity `uint256[]` public inputs.
+    pub public_inputs: String,
+    /// Number of Groth16 Pedersen commitments in the proof (`0` for
+    /// commitment-free circuits and always `0` for PLONK). Lets the caller split
+    /// the Groth16 `proof` blob without re-deriving the layout.
+    pub num_commitments: u32,
+}
+
+/// Convert a Groth16 proof result into Solidity verifier calldata.
+///
+/// Takes the hex proof and public inputs from [`groth16_prove`] and returns the
+/// [`SolidityCalldata`] pieces (`MarshalSolidity` proof blob + `uint256[]`
+/// public inputs). For on-chain verification the proof must have been generated
+/// with `target_solidity = true`.
+///
+/// # Errors
+///
+/// Returns an error if the proof or public inputs fail to deserialize.
+pub fn groth16_solidity_calldata(proof_result: &Groth16ProofResult) -> Result<SolidityCalldata> {
+    let proof = CString::new(proof_result.proof.as_str())?;
+    let pub_inputs = CString::new(proof_result.public_inputs.as_str())?;
+
+    let result = unsafe {
+        bind::gnark_groth16_solidity_calldata(
+            proof.as_ptr() as *mut c_char,
+            pub_inputs.as_ptr() as *mut c_char,
+        )
+    };
+
+    read_solidity_calldata(result, "gnark_groth16_solidity_calldata")
+}
+
+/// Convert a PLONK proof result into Solidity verifier calldata.
+///
+/// Takes the hex proof and public inputs from [`plonk_prove`] and returns the
+/// [`SolidityCalldata`] pieces (`MarshalSolidity` proof blob + `uint256[]`
+/// public inputs). [`num_commitments`](SolidityCalldata::num_commitments) is
+/// always `0` for PLONK.
+///
+/// # Errors
+///
+/// Returns an error if the proof or public inputs fail to deserialize.
+pub fn plonk_solidity_calldata(proof_result: &PlonkProofResult) -> Result<SolidityCalldata> {
+    let proof = CString::new(proof_result.proof.as_str())?;
+    let pub_inputs = CString::new(proof_result.public_inputs.as_str())?;
+
+    let result = unsafe {
+        bind::gnark_plonk_solidity_calldata(
+            proof.as_ptr() as *mut c_char,
+            pub_inputs.as_ptr() as *mut c_char,
+        )
+    };
+
+    read_solidity_calldata(result, "gnark_plonk_solidity_calldata")
+}
+
+/// Marshal a `C_SolidityCalldataResult` into a [`SolidityCalldata`], always
+/// freeing the C allocation. `fn_name` is used only for error messages.
+fn read_solidity_calldata(
+    result: *mut bind::C_SolidityCalldataResult,
+    fn_name: &str,
+) -> Result<SolidityCalldata> {
+    if result.is_null() {
+        bail!("{fn_name} returned null");
+    }
+
+    unsafe {
+        let out = if (*result).error.is_null() {
+            let proof_ptr = (*result).proof;
+            let pub_ptr = (*result).public_inputs;
+
+            if proof_ptr.is_null() || pub_ptr.is_null() {
+                Err(anyhow::anyhow!(
+                    "{fn_name}: proof or public_inputs pointer is null"
+                ))
+            } else {
+                Ok(SolidityCalldata {
+                    proof: CStr::from_ptr(proof_ptr).to_string_lossy().into_owned(),
+                    public_inputs: CStr::from_ptr(pub_ptr).to_string_lossy().into_owned(),
+                    num_commitments: (*result).num_commitments as u32,
+                })
+            }
+        } else {
+            let err = CStr::from_ptr((*result).error)
+                .to_string_lossy()
+                .into_owned();
+            Err(anyhow::anyhow!("{fn_name} failed: {err}"))
+        };
+
+        bind::gnark_free_solidity_calldata_result(result);
+        out
     }
 }
