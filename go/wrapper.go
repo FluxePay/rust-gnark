@@ -61,6 +61,15 @@ import (
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
 	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
+
+	// Hint registration: the exit circuit's R1CS embeds hints from gnark's
+	// logderivarg/rangecheck (countHint, DecomposeHint) and the FluxePay
+	// plonky2 verifier (babybear.ReduceHint). These packages register their
+	// hints in init(); importing them (even blank) makes the solver able to
+	// evaluate the circuit at prove time.
+	_ "github.com/FluxePay/gnark-plonky2-verifier/babybear"
+	_ "github.com/FluxePay/gnark-plonky2-verifier/poseidon2bb"
+	_ "github.com/consensys/gnark/std/rangecheck"
 )
 
 //export gnark_init
