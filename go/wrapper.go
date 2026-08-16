@@ -43,6 +43,7 @@ import "C"
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -80,6 +81,74 @@ func gnark_init() C.int {
 		os.Setenv("GODEBUG", "asyncpreemptoff=1")
 	}
 	return 0
+}
+
+// proofToSolidityBytes reassembles a Groth16 BN254 proof into the exact on-chain
+// Solidity calldata layout:
+//   Ar|Bs|Krs (8 field elements, 256 B) | commitments (2 field elements each) |
+//   commitmentPok (2 field elements), with no 4-byte slice-length prefix.
+// Returns the serialized bytes and the commitment count.
+func proofToSolidityBytes(proof groth16.Proof) ([]byte, int, error) {
+	bn254Proof, ok := proof.(*groth16_bn254.Proof)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected groth16 proof type: %T", proof)
+	}
+	// MarshalSolidity() embeds a 4-byte slice-length prefix before the
+	// commitments slice (from gnark-crypto's RawEncoding of []G1Affine), which
+	// breaks 32-byte alignment.  Reassemble the exact on-chain layout:
+	// Ar|Bs|Krs (256 B) | commitments (64 B per G1 point) | commitmentPok (64 B).
+	numCommitments := len(bn254Proof.Commitments)
+	solProof := bn254Proof.MarshalSolidity()
+	var buf bytes.Buffer
+	buf.Write(solProof[:8*fr.Bytes])
+	for i := range bn254Proof.Commitments {
+		m := bn254Proof.Commitments[i].Marshal() // (X, Y), 64 B
+		buf.Write(m)
+	}
+	if numCommitments > 0 {
+		pok := bn254Proof.CommitmentPok.Marshal() // (X, Y), 64 B
+		buf.Write(pok)
+	}
+	return buf.Bytes(), numCommitments, nil
+}
+
+// solidityBytesToProof parses an on-chain calldata layout proof (as produced by
+// proofToSolidityBytes) back into a gnark proof structure.
+//
+// The calldata layout is the WriteRawTo stream (uncompressed points) with the
+// 4-byte commitments slice-length prefix stripped:
+//   Ar|Bs|Krs (256 B) | Commitments (64 B each) | PoK (64 B)
+// We re-insert the prefix and let gnark's own decoder auto-detect the
+// uncompressed point encoding (msb metadata bits = 0b00).
+func solidityBytesToProof(proofBytes []byte) (*groth16_bn254.Proof, error) {
+	if len(proofBytes) < 8*fr.Bytes+64 {
+		return nil, fmt.Errorf("solidity proof too short: %d bytes", len(proofBytes))
+	}
+	rem := len(proofBytes) - 8*fr.Bytes
+	if rem%64 != 0 {
+		return nil, fmt.Errorf("solidity proof tail not 64-byte aligned: %d bytes", rem)
+	}
+	numCommitments := rem/64 - 1 // the PoK (64 B) always follows the commitments
+	if numCommitments < 0 {
+		numCommitments = 0
+	}
+
+	var buf bytes.Buffer
+	buf.Write(proofBytes[:8*fr.Bytes])
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(numCommitments))
+	buf.Write(count[:])
+	buf.Write(proofBytes[8*fr.Bytes:])
+
+	proof := groth16.NewProof(ecc.BN254)
+	if _, err := proof.ReadFrom(&buf); err != nil {
+		return nil, fmt.Errorf("failed to parse solidity proof: %w", err)
+	}
+	bn254Proof, ok := proof.(*groth16_bn254.Proof)
+	if !ok {
+		return nil, fmt.Errorf("unexpected groth16 proof type: %T", proof)
+	}
+	return bn254Proof, nil
 }
 
 //export gnark_groth16_prove
@@ -144,11 +213,24 @@ func gnark_groth16_prove(
 	}
 
 	var proofBuf bytes.Buffer
-	if _, err := proof.WriteTo(&proofBuf); err != nil {
-		result.error = C.CString(fmt.Sprintf("failed to serialize proof: %v", err))
-		return result
+	if target_solidity != 0 {
+		// Solidity verifier target: return the exact on-chain calldata layout
+		// (Ar|Bs|Krs | commitments | commitmentPok, uncompressed field elements)
+		// instead of the compressed binary serialization. This matches what the
+		// on-chain GnarkGroth16ExitVerifierAdapter expects.
+		solProof, _, err := proofToSolidityBytes(proof)
+		if err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to serialize proof for solidity: %v", err))
+			return result
+		}
+		result.proof = C.CString(hex.EncodeToString(solProof))
+	} else {
+		if _, err := proof.WriteTo(&proofBuf); err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to serialize proof: %v", err))
+			return result
+		}
+		result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
 	}
-	result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
 
 	pubWitness, err := fullWitness.Public()
 	if err != nil {
@@ -199,9 +281,18 @@ func gnark_groth16_verify(
 	if err != nil {
 		return C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
 	}
-	proof := groth16.NewProof(ecc.BN254)
-	if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
-		return C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+	var proof groth16.Proof
+	if target_solidity != 0 {
+		// Proof was serialized in the on-chain calldata layout; parse it back.
+		proof, err = solidityBytesToProof(proofBytes)
+		if err != nil {
+			return C.CString(fmt.Sprintf("failed to deserialize solidity proof: %v", err))
+		}
+	} else {
+		proof = groth16.NewProof(ecc.BN254)
+		if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+			return C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+		}
 	}
 
 	pubBytes, err := hex.DecodeString(C.GoString(public_inputs_hex))
@@ -548,10 +639,20 @@ func gnark_groth16_solidity_calldata(
 		result.error = C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
 		return result
 	}
-	proof := groth16.NewProof(ecc.BN254)
-	if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
-		result.error = C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
-		return result
+	var proof groth16.Proof
+	if len(proofBytes) >= 8*fr.Bytes+64 && len(proofBytes)%64 == 0 {
+		// Already in on-chain calldata layout (prove with target_solidity).
+		proof, err = solidityBytesToProof(proofBytes)
+		if err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to parse calldata proof: %v", err))
+			return result
+		}
+	} else {
+		proof = groth16.NewProof(ecc.BN254)
+		if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+			return result
+		}
 	}
 	bn254Proof, ok := proof.(*groth16_bn254.Proof)
 	if !ok {
