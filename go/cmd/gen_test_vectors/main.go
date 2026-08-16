@@ -32,6 +32,34 @@ func (circuit *CubicCircuit) Define(api frontend.API) error {
 	return nil
 }
 
+// CommittedCircuit is the cubic circuit plus a Pedersen commitment over the
+// witness. The commitment forces gnark's hash-to-field code path, which is the
+// *only* thing WithProverTargetSolidityVerifier changes for Groth16 (Keccak256
+// vs the default RFC-9380 hash). It gives the Rust tests a vector that actually
+// exercises the Solidity flag, unlike the commitment-free CubicCircuit.
+type CommittedCircuit struct {
+	X frontend.Variable `gnark:"X"`
+	Y frontend.Variable `gnark:"Y,public"`
+}
+
+func (circuit *CommittedCircuit) Define(api frontend.API) error {
+	x3 := api.Mul(circuit.X, circuit.X, circuit.X)
+	sum := api.Add(x3, circuit.X, 5)
+	api.AssertIsEqual(sum, circuit.Y)
+
+	committer, ok := api.(frontend.Committer)
+	if !ok {
+		return fmt.Errorf("api does not support commitment")
+	}
+	commitment, err := committer.Commit(circuit.X, circuit.Y)
+	if err != nil {
+		return err
+	}
+	// Constrain the commitment so it becomes part of the proof.
+	api.AssertIsDifferent(commitment, 0)
+	return nil
+}
+
 func main() {
 	outDir := filepath.Join("..", "tests", "test-vectors")
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -40,8 +68,45 @@ func main() {
 
 	generateGroth16(outDir)
 	generatePlonk(outDir)
+	generateCommittedGroth16(outDir)
 
 	fmt.Println("Test vectors generated successfully in", outDir)
+}
+
+// generateCommittedGroth16 emits Groth16 vectors for the commitment circuit,
+// used to test the Solidity-target hash path. Only Groth16 is generated because
+// the Solidity flag is a no-op for PLONK.
+func generateCommittedGroth16(outDir string) {
+	var circuit CommittedCircuit
+	cs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
+	if err != nil {
+		panic(fmt.Sprintf("committed: failed to compile circuit: %v", err))
+	}
+
+	pk, vk, err := groth16.Setup(cs)
+	if err != nil {
+		panic(fmt.Sprintf("committed: failed to run setup: %v", err))
+	}
+
+	writeFile(filepath.Join(outDir, "committed_circuit.r1cs"), func(f *os.File) {
+		if _, err := cs.WriteTo(f); err != nil {
+			panic(fmt.Sprintf("committed: failed to write r1cs: %v", err))
+		}
+	})
+
+	writeFile(filepath.Join(outDir, "committed_circuit.pk"), func(f *os.File) {
+		if _, err := pk.WriteRawTo(f); err != nil {
+			panic(fmt.Sprintf("committed: failed to write pk: %v", err))
+		}
+	})
+
+	writeFile(filepath.Join(outDir, "committed_circuit.vk"), func(f *os.File) {
+		if _, err := vk.WriteTo(f); err != nil {
+			panic(fmt.Sprintf("committed: failed to write vk: %v", err))
+		}
+	})
+
+	fmt.Println("  Committed Groth16 test vectors generated")
 }
 
 func generateGroth16(outDir string) {
@@ -124,4 +189,3 @@ func writeFile(path string, fn func(*os.File)) {
 	defer f.Close()
 	fn(f)
 }
-

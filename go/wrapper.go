@@ -18,11 +18,32 @@ typedef struct {
     char *public_inputs;
     char *error;
 } C_PlonkProofResult;
+
+// Result struct for Solidity calldata export.
+// On success: proof and public_inputs are set, error is NULL.
+//   - proof: hex-encoded, 32-byte-aligned proof calldata. For Groth16 this is
+//     Ar|Bs|Krs (8 field elements) optionally followed by commitments (2 field
+//     elements each) and the commitment proof-of-knowledge (2 field elements) --
+//     reassembled from the proof fields, NOT the raw MarshalSolidity() bytes
+//     (which embed a slice-length prefix). For PLONK it is MarshalSolidity()'s
+//     raw proof byte blob, passed whole as the verifier's `bytes` argument.
+//   - public_inputs: hex-encoded concatenation of the public witness field
+//     elements, each a 32-byte big-endian value ready to pass as a uint256[].
+//   - num_commitments: Groth16 Pedersen commitment count (0 for commitment-free
+//     circuits and for PLONK), so the caller can split the Groth16 blob into
+//     proof[8] | commitments[2*n] | commitmentPok[2].
+typedef struct {
+    char *proof;
+    char *public_inputs;
+    int num_commitments;
+    char *error;
+} C_SolidityCalldataResult;
 */
 import "C"
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -31,11 +52,25 @@ import (
 	"unsafe"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	fr "github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark/backend"
 	"github.com/consensys/gnark/backend/groth16"
+	groth16_bn254 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/backend/plonk"
+	plonk_bn254 "github.com/consensys/gnark/backend/plonk/bn254"
+	"github.com/consensys/gnark/backend/solidity"
 	"github.com/consensys/gnark/backend/witness"
 	"github.com/consensys/gnark/constraint"
 	cs_bn254 "github.com/consensys/gnark/constraint/bn254"
+
+	// Hint registration: the exit circuit's R1CS embeds hints from gnark's
+	// logderivarg/rangecheck (countHint, DecomposeHint) and the FluxePay
+	// plonky2 verifier (babybear.ReduceHint). These packages register their
+	// hints in init(); importing them (even blank) makes the solver able to
+	// evaluate the circuit at prove time.
+	_ "github.com/FluxePay/gnark-plonky2-verifier/babybear"
+	_ "github.com/FluxePay/gnark-plonky2-verifier/poseidon2bb"
+	_ "github.com/consensys/gnark/std/rangecheck"
 )
 
 //export gnark_init
@@ -48,11 +83,80 @@ func gnark_init() C.int {
 	return 0
 }
 
+// proofToSolidityBytes reassembles a Groth16 BN254 proof into the exact on-chain
+// Solidity calldata layout:
+//   Ar|Bs|Krs (8 field elements, 256 B) | commitments (2 field elements each) |
+//   commitmentPok (2 field elements), with no 4-byte slice-length prefix.
+// Returns the serialized bytes and the commitment count.
+func proofToSolidityBytes(proof groth16.Proof) ([]byte, int, error) {
+	bn254Proof, ok := proof.(*groth16_bn254.Proof)
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected groth16 proof type: %T", proof)
+	}
+	// MarshalSolidity() embeds a 4-byte slice-length prefix before the
+	// commitments slice (from gnark-crypto's RawEncoding of []G1Affine), which
+	// breaks 32-byte alignment.  Reassemble the exact on-chain layout:
+	// Ar|Bs|Krs (256 B) | commitments (64 B per G1 point) | commitmentPok (64 B).
+	numCommitments := len(bn254Proof.Commitments)
+	solProof := bn254Proof.MarshalSolidity()
+	var buf bytes.Buffer
+	buf.Write(solProof[:8*fr.Bytes])
+	for i := range bn254Proof.Commitments {
+		m := bn254Proof.Commitments[i].Marshal() // (X, Y), 64 B
+		buf.Write(m)
+	}
+	if numCommitments > 0 {
+		pok := bn254Proof.CommitmentPok.Marshal() // (X, Y), 64 B
+		buf.Write(pok)
+	}
+	return buf.Bytes(), numCommitments, nil
+}
+
+// solidityBytesToProof parses an on-chain calldata layout proof (as produced by
+// proofToSolidityBytes) back into a gnark proof structure.
+//
+// The calldata layout is the WriteRawTo stream (uncompressed points) with the
+// 4-byte commitments slice-length prefix stripped:
+//   Ar|Bs|Krs (256 B) | Commitments (64 B each) | PoK (64 B)
+// We re-insert the prefix and let gnark's own decoder auto-detect the
+// uncompressed point encoding (msb metadata bits = 0b00).
+func solidityBytesToProof(proofBytes []byte) (*groth16_bn254.Proof, error) {
+	if len(proofBytes) < 8*fr.Bytes+64 {
+		return nil, fmt.Errorf("solidity proof too short: %d bytes", len(proofBytes))
+	}
+	rem := len(proofBytes) - 8*fr.Bytes
+	if rem%64 != 0 {
+		return nil, fmt.Errorf("solidity proof tail not 64-byte aligned: %d bytes", rem)
+	}
+	numCommitments := rem/64 - 1 // the PoK (64 B) always follows the commitments
+	if numCommitments < 0 {
+		numCommitments = 0
+	}
+
+	var buf bytes.Buffer
+	buf.Write(proofBytes[:8*fr.Bytes])
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(numCommitments))
+	buf.Write(count[:])
+	buf.Write(proofBytes[8*fr.Bytes:])
+
+	proof := groth16.NewProof(ecc.BN254)
+	if _, err := proof.ReadFrom(&buf); err != nil {
+		return nil, fmt.Errorf("failed to parse solidity proof: %w", err)
+	}
+	bn254Proof, ok := proof.(*groth16_bn254.Proof)
+	if !ok {
+		return nil, fmt.Errorf("unexpected groth16 proof type: %T", proof)
+	}
+	return bn254Proof, nil
+}
+
 //export gnark_groth16_prove
 func gnark_groth16_prove(
 	r1cs_path *C.char,
 	pk_path *C.char,
 	witness_json *C.char,
+	target_solidity C.int,
 ) *C.C_Groth16ProofResult {
 	result := (*C.C_Groth16ProofResult)(C.malloc(C.size_t(unsafe.Sizeof(C.C_Groth16ProofResult{}))))
 	result.proof = nil
@@ -93,18 +197,40 @@ func gnark_groth16_prove(
 		return result
 	}
 
-	proof, err := groth16.Prove(cs, pk, fullWitness)
+	// When targeting a Solidity verifier, gnark's Groth16 must hash the
+	// commitment public input with legacy Keccak256 instead of the default
+	// RFC-9380 hash-to-field. This only affects circuits that use Pedersen
+	// commitments; for commitment-free circuits it is a no-op.
+	var proverOpts []backend.ProverOption
+	if target_solidity != 0 {
+		proverOpts = append(proverOpts, solidity.WithProverTargetSolidityVerifier(backend.GROTH16))
+	}
+
+	proof, err := groth16.Prove(cs, pk, fullWitness, proverOpts...)
 	if err != nil {
 		result.error = C.CString(fmt.Sprintf("proof generation failed: %v", err))
 		return result
 	}
 
 	var proofBuf bytes.Buffer
-	if _, err := proof.WriteTo(&proofBuf); err != nil {
-		result.error = C.CString(fmt.Sprintf("failed to serialize proof: %v", err))
-		return result
+	if target_solidity != 0 {
+		// Solidity verifier target: return the exact on-chain calldata layout
+		// (Ar|Bs|Krs | commitments | commitmentPok, uncompressed field elements)
+		// instead of the compressed binary serialization. This matches what the
+		// on-chain GnarkGroth16ExitVerifierAdapter expects.
+		solProof, _, err := proofToSolidityBytes(proof)
+		if err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to serialize proof for solidity: %v", err))
+			return result
+		}
+		result.proof = C.CString(hex.EncodeToString(solProof))
+	} else {
+		if _, err := proof.WriteTo(&proofBuf); err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to serialize proof: %v", err))
+			return result
+		}
+		result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
 	}
-	result.proof = C.CString(hex.EncodeToString(proofBuf.Bytes()))
 
 	pubWitness, err := fullWitness.Public()
 	if err != nil {
@@ -127,6 +253,7 @@ func gnark_groth16_verify(
 	vk_path *C.char,
 	proof_hex *C.char,
 	public_inputs_hex *C.char,
+	target_solidity C.int,
 ) *C.char {
 	cs := groth16.NewCS(ecc.BN254)
 	r1csFile, err := os.Open(C.GoString(r1cs_path))
@@ -154,9 +281,18 @@ func gnark_groth16_verify(
 	if err != nil {
 		return C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
 	}
-	proof := groth16.NewProof(ecc.BN254)
-	if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
-		return C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+	var proof groth16.Proof
+	if target_solidity != 0 {
+		// Proof was serialized in the on-chain calldata layout; parse it back.
+		proof, err = solidityBytesToProof(proofBytes)
+		if err != nil {
+			return C.CString(fmt.Sprintf("failed to deserialize solidity proof: %v", err))
+		}
+	} else {
+		proof = groth16.NewProof(ecc.BN254)
+		if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+			return C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+		}
 	}
 
 	pubBytes, err := hex.DecodeString(C.GoString(public_inputs_hex))
@@ -171,7 +307,12 @@ func gnark_groth16_verify(
 		return C.CString(fmt.Sprintf("failed to unmarshal public witness: %v", err))
 	}
 
-	if err := groth16.Verify(proof, vk, pubWitness); err != nil {
+	var verifierOpts []backend.VerifierOption
+	if target_solidity != 0 {
+		verifierOpts = append(verifierOpts, solidity.WithVerifierTargetSolidityVerifier(backend.GROTH16))
+	}
+
+	if err := groth16.Verify(proof, vk, pubWitness, verifierOpts...); err != nil {
 		return C.CString(fmt.Sprintf("invalid proof: %v", err))
 	}
 
@@ -297,6 +438,7 @@ func gnark_plonk_prove(
 	scs_path *C.char,
 	pk_path *C.char,
 	witness_json *C.char,
+	target_solidity C.int,
 ) *C.C_PlonkProofResult {
 	result := (*C.C_PlonkProofResult)(C.malloc(C.size_t(unsafe.Sizeof(C.C_PlonkProofResult{}))))
 	result.proof = nil
@@ -336,7 +478,15 @@ func gnark_plonk_prove(
 		return result
 	}
 
-	proof, err := plonk.Prove(cs, pk, fullWitness)
+	// For PLONK the Solidity verifier is directly compatible with the default
+	// prover options, so this option is a documented no-op; we thread it through
+	// for symmetry with Groth16 and to stay correct if gnark changes that.
+	var proverOpts []backend.ProverOption
+	if target_solidity != 0 {
+		proverOpts = append(proverOpts, solidity.WithProverTargetSolidityVerifier(backend.PLONK))
+	}
+
+	proof, err := plonk.Prove(cs, pk, fullWitness, proverOpts...)
 	if err != nil {
 		result.error = C.CString(fmt.Sprintf("plonk proof generation failed: %v", err))
 		return result
@@ -370,6 +520,7 @@ func gnark_plonk_verify(
 	vk_path *C.char,
 	proof_hex *C.char,
 	public_inputs_hex *C.char,
+	target_solidity C.int,
 ) *C.char {
 	cs := plonk.NewCS(ecc.BN254)
 	scsFile, err := os.Open(C.GoString(scs_path))
@@ -414,7 +565,12 @@ func gnark_plonk_verify(
 		return C.CString(fmt.Sprintf("failed to unmarshal public witness: %v", err))
 	}
 
-	if err := plonk.Verify(proof, vk, pubWitness); err != nil {
+	var verifierOpts []backend.VerifierOption
+	if target_solidity != 0 {
+		verifierOpts = append(verifierOpts, solidity.WithVerifierTargetSolidityVerifier(backend.PLONK))
+	}
+
+	if err := plonk.Verify(proof, vk, pubWitness, verifierOpts...); err != nil {
 		return C.CString(fmt.Sprintf("invalid proof: %v", err))
 	}
 
@@ -423,6 +579,168 @@ func gnark_plonk_verify(
 
 //export gnark_free_plonk_proof_result
 func gnark_free_plonk_proof_result(r *C.C_PlonkProofResult) {
+	if r == nil {
+		return
+	}
+	if r.proof != nil {
+		C.free(unsafe.Pointer(r.proof))
+	}
+	if r.public_inputs != nil {
+		C.free(unsafe.Pointer(r.public_inputs))
+	}
+	if r.error != nil {
+		C.free(unsafe.Pointer(r.error))
+	}
+	C.free(unsafe.Pointer(r))
+}
+
+// publicInputsToSolidityCalldata converts a hex-encoded gnark binary public
+// witness (as produced by witness.MarshalBinary and returned from the prove
+// functions) into a hex-encoded concatenation of raw 32-byte big-endian field
+// elements, ready to be passed as a Solidity uint256[] public inputs array.
+func publicInputsToSolidityCalldata(publicInputsHex string) (string, error) {
+	pubBytes, err := hex.DecodeString(publicInputsHex)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode public inputs hex: %w", err)
+	}
+	pubWitness, err := witness.New(ecc.BN254.ScalarField())
+	if err != nil {
+		return "", fmt.Errorf("failed to create witness: %w", err)
+	}
+	if err := pubWitness.UnmarshalBinary(pubBytes); err != nil {
+		return "", fmt.Errorf("failed to unmarshal public witness: %w", err)
+	}
+	vec, ok := pubWitness.Vector().(fr.Vector)
+	if !ok {
+		return "", fmt.Errorf("unexpected public witness vector type: %T", pubWitness.Vector())
+	}
+
+	var buf bytes.Buffer
+	for i := range vec {
+		b := vec[i].Bytes() // [32]byte, big-endian
+		buf.Write(b[:])
+	}
+	return hex.EncodeToString(buf.Bytes()), nil
+}
+
+//export gnark_groth16_solidity_calldata
+func gnark_groth16_solidity_calldata(
+	proof_hex *C.char,
+	public_inputs_hex *C.char,
+) *C.C_SolidityCalldataResult {
+	result := (*C.C_SolidityCalldataResult)(C.malloc(C.size_t(unsafe.Sizeof(C.C_SolidityCalldataResult{}))))
+	result.proof = nil
+	result.public_inputs = nil
+	result.num_commitments = 0
+	result.error = nil
+
+	proofBytes, err := hex.DecodeString(C.GoString(proof_hex))
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
+		return result
+	}
+	var proof groth16.Proof
+	if len(proofBytes) >= 8*fr.Bytes+64 && len(proofBytes)%64 == 0 {
+		// Already in on-chain calldata layout (prove with target_solidity).
+		proof, err = solidityBytesToProof(proofBytes)
+		if err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to parse calldata proof: %v", err))
+			return result
+		}
+	} else {
+		proof = groth16.NewProof(ecc.BN254)
+		if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+			result.error = C.CString(fmt.Sprintf("failed to deserialize proof: %v", err))
+			return result
+		}
+	}
+	bn254Proof, ok := proof.(*groth16_bn254.Proof)
+	if !ok {
+		result.error = C.CString(fmt.Sprintf("unexpected groth16 proof type: %T", proof))
+		return result
+	}
+
+	// We do NOT return MarshalSolidity() verbatim: for a committed proof it
+	// embeds a 4-byte slice-length prefix before the commitments (from
+	// gnark-crypto's slice encoder), which breaks 32-byte alignment. Instead we
+	// assemble the exact on-chain layout as clean field elements:
+	//   Ar|Bs|Krs (8) | commitments (2 per commitment) | commitmentPok (2)
+	// so the caller can split it into verifyProof's uint256[8] / uint256[2n] /
+	// uint256[2] arguments using num_commitments.
+	numCommitments := len(bn254Proof.Commitments)
+	var proofBuf bytes.Buffer
+	// The first 8 field elements of MarshalSolidity are always Ar|Bs|Krs, with
+	// no length prefix (that is exactly the no-commitment return value).
+	solProof := bn254Proof.MarshalSolidity()
+	proofBuf.Write(solProof[:8*fr.Bytes])
+	for i := range bn254Proof.Commitments {
+		m := bn254Proof.Commitments[i].Marshal() // uncompressed (x, y), 2 field elements
+		proofBuf.Write(m)
+	}
+	if numCommitments > 0 {
+		pok := bn254Proof.CommitmentPok.Marshal() // (x, y), 2 field elements
+		proofBuf.Write(pok)
+	}
+	proofCalldata := hex.EncodeToString(proofBuf.Bytes())
+
+	pubCalldata, err := publicInputsToSolidityCalldata(C.GoString(public_inputs_hex))
+	if err != nil {
+		result.error = C.CString(err.Error())
+		return result
+	}
+
+	// Only publish outputs once everything succeeded, so callers never see a
+	// partially-populated result alongside an error.
+	result.proof = C.CString(proofCalldata)
+	result.public_inputs = C.CString(pubCalldata)
+	result.num_commitments = C.int(numCommitments)
+	return result
+}
+
+//export gnark_plonk_solidity_calldata
+func gnark_plonk_solidity_calldata(
+	proof_hex *C.char,
+	public_inputs_hex *C.char,
+) *C.C_SolidityCalldataResult {
+	result := (*C.C_SolidityCalldataResult)(C.malloc(C.size_t(unsafe.Sizeof(C.C_SolidityCalldataResult{}))))
+	result.proof = nil
+	result.public_inputs = nil
+	result.num_commitments = 0
+	result.error = nil
+
+	proofBytes, err := hex.DecodeString(C.GoString(proof_hex))
+	if err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to decode proof hex: %v", err))
+		return result
+	}
+	proof := plonk.NewProof(ecc.BN254)
+	if _, err := proof.ReadFrom(bytes.NewReader(proofBytes)); err != nil {
+		result.error = C.CString(fmt.Sprintf("failed to deserialize plonk proof: %v", err))
+		return result
+	}
+	bn254Proof, ok := proof.(*plonk_bn254.Proof)
+	if !ok {
+		result.error = C.CString(fmt.Sprintf("unexpected plonk proof type: %T", proof))
+		return result
+	}
+
+	// The PLONK Solidity verifier takes the whole proof as a single `bytes`
+	// argument, so there is no separate commitment split (num_commitments stays 0).
+	proofCalldata := hex.EncodeToString(bn254Proof.MarshalSolidity())
+
+	pubCalldata, err := publicInputsToSolidityCalldata(C.GoString(public_inputs_hex))
+	if err != nil {
+		result.error = C.CString(err.Error())
+		return result
+	}
+
+	result.proof = C.CString(proofCalldata)
+	result.public_inputs = C.CString(pubCalldata)
+	return result
+}
+
+//export gnark_free_solidity_calldata_result
+func gnark_free_solidity_calldata_result(r *C.C_SolidityCalldataResult) {
 	if r == nil {
 		return
 	}
